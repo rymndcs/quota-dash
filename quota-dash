@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""quota-dash - one live view of every agent provider's remaining capacity.
+
+quota-axi covers subscription providers (Claude, Codex, and others once signed
+in) but is a one-shot text report. DeepSeek is pay-as-you-go and absent from
+quota-axi entirely, so its balance is read straight from the vendor. This wraps
+both in a redrawing terminal gauge.
+
+Rich owns the layout. An earlier hand-rolled version computed column positions
+by hand and kept drifting, because emoji occupy two terminal cells but one
+Python character - exactly the accounting a table library already does.
+
+Usage: quota-dash [interval-seconds]      (default 60)
+Exit with Ctrl+C.
+
+HISTORY. Every refresh appends a sample to ~/.cache/quota-dash/history.jsonl, and
+the "Daily Consumption" section reports how much was spent per calendar day.
+
+Two things about that derivation, because neither is obvious:
+
+  * A subscription window is ROLLING and resets. `percentUsed` is therefore a
+    level, not a total - you cannot sum it. Daily spend is the sum of the
+    POSITIVE deltas between consecutive samples; a drop means the window reset,
+    not that capacity came back. Resets are detected from `resetsAt` moving, not
+    from the number falling, because a reset and a re-read can look alike.
+  * History is only as complete as the times this dashboard was OPEN. A day
+    spent working with it closed shows as a gap, not as zero. The table says
+    which, rather than letting a gap read as an idle day.
+"""
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+try:
+    from rich.align import Align
+    from rich.console import Console, Group
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.rule import Rule
+    from rich.table import Table
+    from rich.text import Text
+except ImportError:
+    sys.exit("quota-dash: rich is not installed — `uv pip install --system rich`")
+
+DEEPSEEK_AUTH = Path.home() / ".pi/agent/auth.json"
+DEEPSEEK_PEAK_HOURS_UTC = {1, 2, 3, 6, 7, 8, 9}   # double price in these windows
+INTERVAL = int(sys.argv[1]) if len(sys.argv) > 1 else 60
+
+console = Console()
+
+
+# ---------------------------------------------------------------- data reads
+def read_quota():
+    try:
+        out = subprocess.run(["quota-axi", "--json"], capture_output=True,
+                             text=True, timeout=45).stdout
+        return json.loads(out)
+    except Exception:
+        return None
+
+
+def read_deepseek():
+    """(balance, availability) — or a one-word status in the first slot.
+
+    The key is read here and never printed or returned.
+    """
+    if not DEEPSEEK_AUTH.exists():
+        return ("unconfigured", "")
+    try:
+        key = json.loads(DEEPSEEK_AUTH.read_text()).get("deepseek", {}).get("key", "")
+    except Exception:
+        key = ""
+    if not key:
+        return ("unconfigured", "")
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            "https://api.deepseek.com/user/balance",
+            headers={"Authorization": f"Bearer {key}"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            d = json.load(r)
+        info = (d.get("balance_infos") or [{}])[0]
+        return (info.get("total_balance", "?"), "yes" if d.get("is_available") else "no")
+    except Exception:
+        return ("unreachable", "")
+
+
+# ------------------------------------------------------------------ helpers
+def as_local(iso):
+    if not iso or iso == "unknown":
+        return None
+    try:
+        return datetime.fromisoformat(str(iso).replace("Z", "+00:00")).astimezone()
+    except Exception:
+        return None
+
+
+def span(hours):
+    if hours < 1:
+        return f"{hours * 60:.0f}m"
+    if hours < 6:
+        return f"{int(hours)}h {(hours % 1) * 60:.0f}m"
+    if hours < 48:
+        return f"{hours:.0f}h"
+    return f"{hours / 24:.1f}d"
+
+
+def gauge(pct, width=26):
+    pct = max(0.0, min(100.0, float(pct)))
+    filled = round(width * pct / 100)
+    colour = "green" if pct >= 50 else ("yellow" if pct >= 20 else "red")
+    t = Text()
+    t.append("[", style="dim")
+    t.append("█" * filled, style=colour)
+    t.append("░" * (width - filled), style="dim")
+    t.append("]", style="dim")
+    return t
+
+
+def dot(pct):
+    return "🟢" if pct >= 50 else ("🟡" if pct >= 20 else "🔴")
+
+
+def heading(icon, title, subtitle):
+    t = Text()
+    t.append(f"{icon} ")
+    t.append(title, style="bold")
+    t.append(f"    {subtitle}", style="dim")
+    return t
+
+
+# ------------------------------------------------------------------ sections
+def windows_table(live_providers):
+    t = Table(box=None, pad_edge=False, show_header=False, padding=(0, 1, 1, 1))
+    t.add_column(width=18)
+    t.add_column(width=2)
+    t.add_column(width=28)
+    t.add_column(justify="right", width=6)
+    t.add_column()
+
+    rows = []
+    now = datetime.now().astimezone()
+    for p in live_providers:
+        prov = (p.get("provider") or "?").capitalize()
+        for w in p.get("windows", []):
+            pct = w.get("percentRemaining")
+            if not isinstance(pct, (int, float)):
+                continue
+            rows.append((prov, w))
+            label = f"{prov} {(w.get('label') or w.get('id') or '')}".strip()
+            reset = as_local(w.get("resetsAt"))
+            when = Text()
+            if reset:
+                hrs = (reset - now).total_seconds() / 3600
+                stamp = reset.strftime("%H:%M") if hrs < 24 else reset.strftime("%a %H:%M")
+                when.append(stamp)
+                when.append(f"   in {span(hrs)}", style="dim")
+            t.add_row(label, dot(pct), gauge(pct), f"{pct:.1f}%", when)
+    if not rows:
+        t.add_row(Text("no window data", style="dim"), "", "", "", "")
+    return t, rows
+
+
+def pace_table(rows):
+    """Burn rate and prediction side by side, divided, sharing one label column."""
+    t = Table(box=None, pad_edge=False, padding=(0, 1, 1, 1), show_edge=False,
+              header_style="bold")
+    t.add_column("", width=18)
+    t.add_column("🔥 Burn Rate", width=22)
+    t.add_column("│", width=1, style="dim")
+    t.add_column("🔮 Prediction")
+
+    now = datetime.now().astimezone()
+    for prov, w in rows:
+        label = f"{prov} {(w.get('label') or w.get('id') or '')}".strip()
+        pace = w.get("pace") if isinstance(w.get("pace"), dict) else {}
+
+        burn = pace.get("burnMultiple")
+        left = Text()
+        if isinstance(burn, (int, float)):
+            style = "green" if burn < 0.9 else ("cyan" if burn <= 1.1 else "red")
+            word = ("under budget" if burn < 0.9
+                    else ("on budget" if burn <= 1.1 else "OVER ⚡"))
+            left.append(f"{burn:.2f}×  ", style=style)
+            left.append(word, style="dim")
+        else:
+            left.append("—  no pace data", style="dim")
+
+        out = as_local(pace.get("projectedExhaustedAt"))
+        reset = as_local(w.get("resetsAt"))
+        right = Text()
+        if out and reset and out < reset:
+            early = (reset - out).total_seconds() / 3600
+            right.append(f"runs dry {out.strftime('%a %H:%M')}", style="red")
+            right.append(f"  ·  {span(early)} early", style="dim")
+        elif reset:
+            right.append("lasts through reset", style="green")
+            right.append(f"  ·  {span((reset - now).total_seconds() / 3600)} to go",
+                         style="dim")
+        else:
+            right.append("no projection", style="dim")
+
+        t.add_row(label, left, "│", right)
+    return t
+
+
+def payg_table(bal, avail):
+    t = Table(box=None, pad_edge=False, show_header=False, padding=(0, 1, 1, 1))
+    t.add_column(width=18)
+    t.add_column(width=2)
+    t.add_column()
+    if bal in ("unconfigured", "unreachable"):
+        note = "no key configured" if bal == "unconfigured" else "balance unreachable"
+        t.add_row("DeepSeek", "⚪", Text(note, style="dim"))
+        return t
+
+    peak = datetime.now(timezone.utc).hour in DEEPSEEK_PEAK_HOURS_UTC
+    ok = avail != "no"
+    line = Text()
+    line.append(f"${bal}", style="green" if ok else "red")
+    if not ok:
+        line.append("   UNUSABLE — top up before routing work here", style="red")
+    t.add_row("DeepSeek balance", "🟢" if ok else "🔴", line)
+
+    price = Text()
+    if peak:
+        price.append("⚡ PEAK — 2× price, route elsewhere", style="yellow")
+    else:
+        price.append("off-peak — base price", style="green")
+    t.add_row("", "", price)
+    return t
+
+
+# -------------------------------------------------------------------- render
+def frame():
+    data = read_quota()
+    bal, avail = read_deepseek()
+    now = datetime.now().astimezone()
+
+    if data is None:
+        return Panel(Text("quota-axi returned nothing readable — is it authenticated?",
+                          style="red"), title="AGENT CAPACITY", border_style="red")
+
+    live = [p for p in data.get("providers", []) if p.get("source") != "unavailable"]
+    asleep = [p.get("provider") for p in data.get("providers", [])
+              if p.get("source") == "unavailable"]
+
+    wtable, rows = windows_table(live)
+    tag = "  ·  ".join(f"{p.get('provider')} {p.get('plan', '')}".strip() for p in live)
+
+    body = Group(
+        Text(tag, style="dim"),
+        Text(),
+        heading("📊", "Subscription Windows", "capacity left before each window resets"),
+        Rule(style="grey30"),
+        wtable,
+        Text(),
+        heading("⏱", "Pace", "1.00× spends the window exactly as it elapses"),
+        Rule(style="grey30"),
+        pace_table(rows),
+        Text(),
+        heading("💰", "Pay-as-you-go", "no window to spend down — only a balance"),
+        Rule(style="grey30"),
+        payg_table(bal, avail),
+    )
+
+    foot = Text()
+    foot.append(f"⏰ {now.strftime('%H:%M:%S')}   ")
+    foot.append(f"📡 {len(live)} live", style="green")
+    if asleep:
+        foot.append(f"   💤 {', '.join(asleep)}", style="dim")
+    foot.append(f"   refresh {INTERVAL}s · Ctrl+C to exit", style="dim")
+
+    return Panel(Group(body, Text(), Align.left(foot)),
+                 title="[bold]✦ AGENT CAPACITY ✦[/bold]",
+                 subtitle=f"[dim]{now.strftime('%a %d %b')}[/dim]",
+                 border_style="cyan", padding=(1, 2))
+
+
+def main():
+    try:
+        with Live(frame(), console=console, refresh_per_second=4,
+                  screen=True) as view:
+            while True:
+                time.sleep(INTERVAL)
+                view.update(frame())
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

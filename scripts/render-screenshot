@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""Regenerate assets/quota-dash.svg from fixed, non-account data."""
+from __future__ import annotations
+
+import os
+import runpy
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+from rich.console import Console
+
+ROOT = Path(__file__).resolve().parents[1]
+
+# Keep calendar-day grouping identical in every environment.
+os.environ["TZ"] = "UTC"
+if hasattr(time, "tzset"):
+    time.tzset()
+
+dashboard = runpy.run_path(str(ROOT / "quota-dash"))
+render_dashboard = dashboard["render_dashboard"]
+
+NOW = datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc)
+QUOTAS = {
+    "providers": [
+        {
+            "provider": "claude",
+            "plan": "Max",
+            "source": "live",
+            "windows": [{
+                "id": "five-hour",
+                "label": "5-hour",
+                "percentRemaining": 72.4,
+                "resetsAt": "2026-08-08T15:30:00Z",
+                "pace": {"burnMultiple": 0.81},
+            }],
+        },
+        {
+            "provider": "codex",
+            "plan": "Plus",
+            "source": "live",
+            "windows": [
+                {
+                    "id": "five-hour",
+                    "label": "5-hour",
+                    "percentRemaining": 46.8,
+                    "resetsAt": "2026-08-08T14:45:00Z",
+                    "pace": {
+                        "burnMultiple": 1.24,
+                        "projectedExhaustedAt": "2026-08-08T14:08:00Z",
+                    },
+                },
+                {
+                    "id": "weekly",
+                    "label": "Weekly",
+                    "percentRemaining": 63.2,
+                    "resetsAt": "2026-08-11T08:00:00Z",
+                    "pace": {"burnMultiple": 0.94},
+                },
+            ],
+        },
+        {"provider": "kimi", "source": "unavailable", "windows": []},
+    ]
+}
+BALANCE = {
+    "total_balance": "25.00",
+    "granted_balance": "2.00",
+    "topped_up_balance": "23.00",
+}
+HISTORY = [
+    {"at": "2026-08-07T09:00:00Z", "deepseek": {
+        "total_balance": "23.00", "granted_balance": "3.00",
+        "topped_up_balance": "20.00"}},
+    {"at": "2026-08-07T09:02:00Z", "deepseek": {
+        "total_balance": "22.00", "granted_balance": "3.00",
+        "topped_up_balance": "19.00"}},
+    {"at": "2026-08-08T10:00:00Z", "deepseek": {
+        "total_balance": "32.00", "granted_balance": "3.00",
+        "topped_up_balance": "29.00"}},
+    {"at": "2026-08-08T10:02:00Z", "deepseek": BALANCE},
+]
+
+console = Console(record=True, width=120, color_system="truecolor")
+console.print(render_dashboard(QUOTAS, BALANCE, "yes", HISTORY, now=NOW))
+output = ROOT / "assets" / "quota-dash.svg"
+console.save_svg(str(output), title="quota-dash — illustrative data")
+
+# Rich 13.7 emits two whitespace-only SVG lines; normalize them for clean diffs.
+svg = output.read_text()
+output.write_text("\n".join(line.rstrip() for line in svg.splitlines()) + "\n")

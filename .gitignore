@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.venv/
+.cache/
+.quota-dash/
+auth.json
+history.jsonl

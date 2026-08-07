@@ -1,39 +1,5 @@
 #!/usr/bin/env python3
-"""quota-dash - one live view of every agent provider's remaining capacity.
-
-quota-axi covers subscription providers (Claude, Codex, and others once signed
-in) but is a one-shot text report. DeepSeek is pay-as-you-go and absent from
-quota-axi entirely, so its balance is read straight from the vendor. This wraps
-both in a redrawing terminal gauge.
-
-Rich owns the layout. An earlier hand-rolled version computed column positions
-by hand and kept drifting, because emoji occupy two terminal cells but one
-Python character - exactly the accounting a table library already does.
-
-Usage: quota-dash [interval-seconds]      (default 60)
-Exit with Ctrl+C.
-
-HISTORY. Every successful DeepSeek refresh appends its three USD balance fields
-to ~/.cache/quota-dash/history.jsonl. Failed or malformed reads are never
-recorded. The "DeepSeek History" section reports usage and top-ups separately.
-
-Three things about that derivation, because none is obvious:
-
-  * A subscription window is ROLLING and resets. `percentUsed` is therefore a
-    level, not a total - you cannot sum it. Daily spend is the sum of the
-    POSITIVE deltas between consecutive samples; a drop means the window reset,
-    not that capacity came back. Resets are detected from `resetsAt` moving, not
-    from the number falling, because a reset and a re-read can look alike.
-  * A prepaid balance has the opposite shape. Decreases in either the topped-up
-    or granted component are usage; increases in the topped-up component are
-    top-ups. Component balances keep a new grant from looking like a top-up,
-    but sampling cannot reconstruct spend and a top-up which both happen in the
-    same component between two samples: only their net change is observable.
-  * History is only as complete as the times this dashboard was OPEN. A day
-    spent working with it closed is a gap, not a known zero. Changes after a gap
-    are assigned to the day they are observed and marked, rather than implying
-    calendar-day precision the samples do not contain.
-"""
+"""A live terminal dashboard for subscription quotas and DeepSeek credit."""
 from __future__ import annotations
 
 import json
@@ -55,9 +21,10 @@ try:
     from rich.table import Table
     from rich.text import Text
 except ImportError:
-    sys.exit("quota-dash: rich is not installed — `uv pip install --system rich`")
+    sys.exit("quota-dash: rich is not installed — run `python3 -m pip install rich`")
 
-DEEPSEEK_AUTH = Path.home() / ".pi/agent/auth.json"
+DEEPSEEK_AUTH = Path.home() / ".quota-dash/auth.json"
+LEGACY_DEEPSEEK_AUTH = Path.home() / ".pi/agent/auth.json"
 DEEPSEEK_PEAK_HOURS_UTC = {1, 2, 3, 6, 7, 8, 9}   # double price in these windows
 HISTORY_FILE = Path(os.environ.get(
     "QUOTA_DASH_HISTORY", Path.home() / ".cache/quota-dash/history.jsonl"))
@@ -88,19 +55,26 @@ def _balance(value):
     return format(number, "f")
 
 
+def _deepseek_key():
+    """Return (key, using legacy file); malformed/missing files are normal."""
+    for path, legacy in ((DEEPSEEK_AUTH, False), (LEGACY_DEEPSEEK_AUTH, True)):
+        try:
+            key = json.loads(path.read_text()).get("deepseek", {}).get("key", "")
+        except (AttributeError, OSError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(key, str) and key:
+            return key, legacy
+    return "", False
+
+
 def read_deepseek():
-    """(validated balance mapping, availability) or (status, "").
+    """Return (validated balance/status, availability, using legacy auth).
 
     The key is read here and never printed or returned.
     """
-    if not DEEPSEEK_AUTH.exists():
-        return ("unconfigured", "")
-    try:
-        key = json.loads(DEEPSEEK_AUTH.read_text()).get("deepseek", {}).get("key", "")
-    except Exception:
-        key = ""
+    key, legacy_auth = _deepseek_key()
     if not key:
-        return ("unconfigured", "")
+        return ("unconfigured", "", False)
     try:
         import urllib.request
         req = urllib.request.Request(
@@ -118,9 +92,9 @@ def read_deepseek():
         if info is None:
             raise ValueError("USD balance missing")
         balances = _clean_balances(info)
-        return (balances, "yes" if d["is_available"] else "no")
+        return (balances, "yes" if d["is_available"] else "no", legacy_auth)
     except Exception:
-        return ("unreachable", "")
+        return ("unreachable", "", legacy_auth)
 
 
 # --------------------------------------------------------------- history I/O
@@ -263,7 +237,7 @@ def heading(icon, title, subtitle):
 
 
 # ------------------------------------------------------------------ sections
-def windows_table(live_providers):
+def windows_table(live_providers, now=None):
     t = Table(box=None, pad_edge=False, show_header=False, padding=(0, 1, 1, 1))
     t.add_column(width=18)
     t.add_column(width=2)
@@ -272,7 +246,7 @@ def windows_table(live_providers):
     t.add_column()
 
     rows = []
-    now = datetime.now().astimezone()
+    now = now or datetime.now().astimezone()
     for p in live_providers:
         prov = (p.get("provider") or "?").capitalize()
         for w in p.get("windows", []):
@@ -294,7 +268,7 @@ def windows_table(live_providers):
     return t, rows
 
 
-def pace_table(rows):
+def pace_table(rows, now=None):
     """Burn rate and prediction side by side, divided, sharing one label column."""
     t = Table(box=None, pad_edge=False, padding=(0, 1, 1, 1), show_edge=False,
               header_style="bold")
@@ -303,7 +277,7 @@ def pace_table(rows):
     t.add_column("│", width=1, style="dim")
     t.add_column("🔮 Prediction")
 
-    now = datetime.now().astimezone()
+    now = now or datetime.now().astimezone()
     for prov, w in rows:
         label = f"{prov} {(w.get('label') or w.get('id') or '')}".strip()
         pace = w.get("pace") if isinstance(w.get("pace"), dict) else {}
@@ -337,7 +311,7 @@ def pace_table(rows):
     return t
 
 
-def payg_table(bal, avail):
+def payg_table(bal, avail, legacy_auth=False, now=None):
     t = Table(box=None, pad_edge=False, show_header=False, padding=(0, 1, 1, 1))
     t.add_column(width=18)
     t.add_column(width=2)
@@ -345,22 +319,26 @@ def payg_table(bal, avail):
     if isinstance(bal, str):
         note = "no key configured" if bal == "unconfigured" else "balance unreachable"
         t.add_row("DeepSeek", "⚪", Text(note, style="dim"))
-        return t
-
-    peak = datetime.now(timezone.utc).hour in DEEPSEEK_PEAK_HOURS_UTC
-    ok = avail != "no"
-    line = Text()
-    line.append(f"${bal['total_balance']}", style="green" if ok else "red")
-    if not ok:
-        line.append("   UNUSABLE — top up before routing work here", style="red")
-    t.add_row("DeepSeek balance", "🟢" if ok else "🔴", line)
-
-    price = Text()
-    if peak:
-        price.append("⚡ PEAK — 2× price, route elsewhere", style="yellow")
     else:
-        price.append("off-peak — base price", style="green")
-    t.add_row("", "", price)
+        now = now or datetime.now().astimezone()
+        peak = now.astimezone(timezone.utc).hour in DEEPSEEK_PEAK_HOURS_UTC
+        ok = avail != "no"
+        line = Text()
+        line.append(f"${bal['total_balance']}", style="green" if ok else "red")
+        if not ok:
+            line.append("   UNUSABLE — top up before routing work here", style="red")
+        t.add_row("DeepSeek balance", "🟢" if ok else "🔴", line)
+
+        price = Text()
+        if peak:
+            price.append("⚡ PEAK — 2× price, route elsewhere", style="yellow")
+        else:
+            price.append("off-peak — base price", style="green")
+        t.add_row("", "", price)
+    if legacy_auth:
+        t.add_row("Auth", "↪", Text(
+            "using ~/.pi/agent/auth.json; migrate to ~/.quota-dash/auth.json",
+            style="dim"))
     return t
 
 
@@ -399,27 +377,14 @@ def deepseek_history_table(records):
 
 
 # -------------------------------------------------------------------- render
-def frame():
-    data = read_quota()
-    bal, avail = read_deepseek()
-    now = datetime.now().astimezone()
-
-    if isinstance(bal, dict):
-        try:
-            append_history(bal)
-        except (KeyError, OSError, TypeError, ValueError):
-            pass
-    history = load_history()
-
-    if data is None:
-        return Panel(Text("quota-axi returned nothing readable — is it authenticated?",
-                          style="red"), title="AGENT CAPACITY", border_style="red")
-
+def render_dashboard(data, bal, avail, history, legacy_auth=False, now=None):
+    """Build a dashboard from supplied data (also used by the SVG renderer)."""
+    now = now or datetime.now().astimezone()
     live = [p for p in data.get("providers", []) if p.get("source") != "unavailable"]
     asleep = [p.get("provider") for p in data.get("providers", [])
               if p.get("source") == "unavailable"]
 
-    wtable, rows = windows_table(live)
+    wtable, rows = windows_table(live, now)
     tag = "  ·  ".join(f"{p.get('provider')} {p.get('plan', '')}".strip() for p in live)
 
     body = Group(
@@ -431,11 +396,11 @@ def frame():
         Text(),
         heading("⏱", "Pace", "1.00× spends the window exactly as it elapses"),
         Rule(style="grey30"),
-        pace_table(rows),
+        pace_table(rows, now),
         Text(),
         heading("💰", "Pay-as-you-go", "no window to spend down — only a balance"),
         Rule(style="grey30"),
-        payg_table(bal, avail),
+        payg_table(bal, avail, legacy_auth, now),
         Text(),
         heading("📅", "DeepSeek History", "directions stay separate; burn uses usage only"),
         Rule(style="grey30"),
@@ -453,6 +418,24 @@ def frame():
                  title="[bold]✦ AGENT CAPACITY ✦[/bold]",
                  subtitle=f"[dim]{now.strftime('%a %d %b')}[/dim]",
                  border_style="cyan", padding=(1, 2))
+
+
+def frame():
+    data = read_quota()
+    bal, avail, legacy_auth = read_deepseek()
+    now = datetime.now().astimezone()
+
+    if isinstance(bal, dict):
+        try:
+            append_history(bal)
+        except (KeyError, OSError, TypeError, ValueError):
+            pass
+    history = load_history()
+
+    if data is None:
+        return Panel(Text("quota-axi returned nothing readable — is it authenticated?",
+                          style="red"), title="AGENT CAPACITY", border_style="red")
+    return render_dashboard(data, bal, avail, history, legacy_auth, now)
 
 
 def main():

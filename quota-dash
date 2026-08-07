@@ -13,27 +13,37 @@ Python character - exactly the accounting a table library already does.
 Usage: quota-dash [interval-seconds]      (default 60)
 Exit with Ctrl+C.
 
-HISTORY. Every refresh appends a sample to ~/.cache/quota-dash/history.jsonl, and
-the "Daily Consumption" section reports how much was spent per calendar day.
+HISTORY. Every successful DeepSeek refresh appends its three USD balance fields
+to ~/.cache/quota-dash/history.jsonl. Failed or malformed reads are never
+recorded. The "DeepSeek History" section reports usage and top-ups separately.
 
-Two things about that derivation, because neither is obvious:
+Three things about that derivation, because none is obvious:
 
   * A subscription window is ROLLING and resets. `percentUsed` is therefore a
     level, not a total - you cannot sum it. Daily spend is the sum of the
     POSITIVE deltas between consecutive samples; a drop means the window reset,
     not that capacity came back. Resets are detected from `resetsAt` moving, not
     from the number falling, because a reset and a re-read can look alike.
+  * A prepaid balance has the opposite shape. Decreases in either the topped-up
+    or granted component are usage; increases in the topped-up component are
+    top-ups. Component balances keep a new grant from looking like a top-up,
+    but sampling cannot reconstruct spend and a top-up which both happen in the
+    same component between two samples: only their net change is observable.
   * History is only as complete as the times this dashboard was OPEN. A day
-    spent working with it closed shows as a gap, not as zero. The table says
-    which, rather than letting a gap read as an idle day.
+    spent working with it closed is a gap, not a known zero. Changes after a gap
+    are assigned to the day they are observed and marked, rather than implying
+    calendar-day precision the samples do not contain.
 """
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import time
+from collections import defaultdict, deque
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 try:
@@ -49,7 +59,10 @@ except ImportError:
 
 DEEPSEEK_AUTH = Path.home() / ".pi/agent/auth.json"
 DEEPSEEK_PEAK_HOURS_UTC = {1, 2, 3, 6, 7, 8, 9}   # double price in these windows
-INTERVAL = int(sys.argv[1]) if len(sys.argv) > 1 else 60
+HISTORY_FILE = Path(os.environ.get(
+    "QUOTA_DASH_HISTORY", Path.home() / ".cache/quota-dash/history.jsonl"))
+INTERVAL = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 60
+HISTORY_GAP_SECONDS = max(INTERVAL * 2.5, 5 * 60)
 
 console = Console()
 
@@ -64,8 +77,19 @@ def read_quota():
         return None
 
 
+def _balance(value):
+    """Return a canonical non-negative decimal string, or raise ValueError."""
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        raise ValueError("invalid balance") from None
+    if not number.is_finite() or number < 0:
+        raise ValueError("invalid balance")
+    return format(number, "f")
+
+
 def read_deepseek():
-    """(balance, availability) — or a one-word status in the first slot.
+    """(validated balance mapping, availability) or (status, "").
 
     The key is read here and never printed or returned.
     """
@@ -84,10 +108,114 @@ def read_deepseek():
             headers={"Authorization": f"Bearer {key}"})
         with urllib.request.urlopen(req, timeout=10) as r:
             d = json.load(r)
-        info = (d.get("balance_infos") or [{}])[0]
-        return (info.get("total_balance", "?"), "yes" if d.get("is_available") else "no")
+        if not isinstance(d.get("is_available"), bool):
+            raise ValueError("invalid availability")
+        infos = d.get("balance_infos")
+        if not isinstance(infos, list):
+            raise ValueError("invalid balances")
+        info = next((item for item in infos
+                     if isinstance(item, dict) and item.get("currency") == "USD"), None)
+        if info is None:
+            raise ValueError("USD balance missing")
+        balances = _clean_balances(info)
+        return (balances, "yes" if d["is_available"] else "no")
     except Exception:
         return ("unreachable", "")
+
+
+# --------------------------------------------------------------- history I/O
+def _clean_balances(balances):
+    clean = {key: _balance(balances[key]) for key in (
+        "total_balance", "granted_balance", "topped_up_balance")}
+    parts = Decimal(clean["granted_balance"]) + Decimal(clean["topped_up_balance"])
+    if abs(Decimal(clean["total_balance"]) - parts) > Decimal("0.000001"):
+        raise ValueError("balance components do not match total")
+    return clean
+
+
+def load_history(path=None, limit=20000, tail_bytes=4 * 1024 * 1024):
+    """Read recent complete JSONL records; tolerate partial/concurrent writes."""
+    path = path or HISTORY_FILE
+    records = deque(maxlen=limit)
+    try:
+        with path.open("rb") as stream:
+            size = stream.seek(0, os.SEEK_END)
+            offset = max(0, size - tail_bytes)
+            stream.seek(offset)
+            if offset:
+                stream.readline()  # discard a record cut by the bounded tail read
+            for raw in stream:
+                try:
+                    item = json.loads(raw)
+                    deepseek = item.get("deepseek")
+                    datetime.fromisoformat(item["at"].replace("Z", "+00:00"))
+                    if not isinstance(deepseek, dict):
+                        continue
+                    item["deepseek"] = _clean_balances(deepseek)
+                    records.append(item)
+                except (AttributeError, KeyError, TypeError, ValueError,
+                        json.JSONDecodeError):
+                    continue
+    except OSError:
+        pass
+    return list(records)
+
+
+def append_history(balances, path=None, at=None):
+    """Append one validated DeepSeek sample with a single O_APPEND write."""
+    path = path or HISTORY_FILE
+    clean = _clean_balances(balances)
+    stamp = at or datetime.now(timezone.utc)
+    record = {"version": 1, "at": stamp.astimezone(timezone.utc).isoformat(),
+              "deepseek": clean}
+    line = (json.dumps(record, separators=(",", ":")) + "\n").encode()
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(fd, line)
+    finally:
+        os.close(fd)
+    return record
+
+
+def deepseek_history(records, gap_seconds=HISTORY_GAP_SECONDS):
+    """Return calendar-day direction totals and a usage-only daily burn rate."""
+    days = defaultdict(lambda: {"usage": Decimal(0), "topups": Decimal(0),
+                                "samples": 0, "gap": False})
+    parsed = []
+    for record in records:
+        try:
+            stamp = datetime.fromisoformat(record["at"].replace("Z", "+00:00"))
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            values = {key: Decimal(record["deepseek"][key]) for key in (
+                "granted_balance", "topped_up_balance")}
+        except (AttributeError, KeyError, TypeError, ValueError, InvalidOperation):
+            continue
+        parsed.append((stamp, values))
+        days[stamp.astimezone().date()]["samples"] += 1
+
+    parsed.sort(key=lambda sample: sample[0])
+    events = []
+    for (before_at, before), (after_at, after) in zip(parsed, parsed[1:]):
+        if after_at <= before_at:
+            continue
+        day = after_at.astimezone().date()
+        usage = sum((max(before[key] - after[key], Decimal(0))
+                     for key in before), Decimal(0))
+        topup = max(after["topped_up_balance"] - before["topped_up_balance"],
+                    Decimal(0))
+        days[day]["usage"] += usage
+        days[day]["topups"] += topup
+        if (after_at - before_at).total_seconds() > gap_seconds:
+            days[day]["gap"] = True
+        if topup:
+            events.append((after_at, topup))
+
+    ordered = sorted(days.items())
+    usage = sum((values["usage"] for _, values in ordered), Decimal(0))
+    burn = usage / len(ordered) if ordered else Decimal(0)
+    return ordered, events, burn
 
 
 # ------------------------------------------------------------------ helpers
@@ -214,7 +342,7 @@ def payg_table(bal, avail):
     t.add_column(width=18)
     t.add_column(width=2)
     t.add_column()
-    if bal in ("unconfigured", "unreachable"):
+    if isinstance(bal, str):
         note = "no key configured" if bal == "unconfigured" else "balance unreachable"
         t.add_row("DeepSeek", "⚪", Text(note, style="dim"))
         return t
@@ -222,7 +350,7 @@ def payg_table(bal, avail):
     peak = datetime.now(timezone.utc).hour in DEEPSEEK_PEAK_HOURS_UTC
     ok = avail != "no"
     line = Text()
-    line.append(f"${bal}", style="green" if ok else "red")
+    line.append(f"${bal['total_balance']}", style="green" if ok else "red")
     if not ok:
         line.append("   UNUSABLE — top up before routing work here", style="red")
     t.add_row("DeepSeek balance", "🟢" if ok else "🔴", line)
@@ -236,11 +364,52 @@ def payg_table(bal, avail):
     return t
 
 
+def deepseek_history_table(records):
+    t = Table(box=None, pad_edge=False, padding=(0, 1, 1, 1), show_edge=False,
+              header_style="bold")
+    t.add_column("Date", width=12)
+    t.add_column("Usage", justify="right", width=12)
+    t.add_column("Top-ups", justify="right", width=12)
+    t.add_column("Observation")
+
+    days, events, _ = deepseek_history(records)
+    if not days:
+        t.add_row("—", "—", "—", Text("no history yet", style="dim"))
+        return t
+    shown = days[-7:]
+    usage = sum((values["usage"] for _, values in shown), Decimal(0))
+    burn = usage / len(shown)
+    for day, values in shown:
+        observation = f"{values['samples']} sample{'s' if values['samples'] != 1 else ''}"
+        if values["gap"]:
+            observation += "  ·  after gap *"
+        t.add_row(day.isoformat(), f"${values['usage']:.2f}",
+                  f"${values['topups']:.2f}", observation)
+    t.add_row("", "", "", "")
+    t.add_row("Usage burn", f"${burn:.2f}/day", "",
+              f"{len(shown)} sampled calendar day{'s' if len(shown) != 1 else ''}")
+    if events:
+        latest_at, latest_amount = events[-1]
+        t.add_row("Latest top-up", "", f"${latest_amount:.2f}",
+                  latest_at.astimezone().strftime("%a %d %b %H:%M"))
+    if any(values["gap"] for _, values in shown):
+        t.add_row("*", "", "", Text(
+            "change assigned when observed; exact day unknown", style="dim"))
+    return t
+
+
 # -------------------------------------------------------------------- render
 def frame():
     data = read_quota()
     bal, avail = read_deepseek()
     now = datetime.now().astimezone()
+
+    if isinstance(bal, dict):
+        try:
+            append_history(bal)
+        except (KeyError, OSError, TypeError, ValueError):
+            pass
+    history = load_history()
 
     if data is None:
         return Panel(Text("quota-axi returned nothing readable — is it authenticated?",
@@ -267,6 +436,10 @@ def frame():
         heading("💰", "Pay-as-you-go", "no window to spend down — only a balance"),
         Rule(style="grey30"),
         payg_table(bal, avail),
+        Text(),
+        heading("📅", "DeepSeek History", "directions stay separate; burn uses usage only"),
+        Rule(style="grey30"),
+        deepseek_history_table(history),
     )
 
     foot = Text()

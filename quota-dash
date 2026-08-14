@@ -2,6 +2,7 @@
 """A live terminal dashboard for subscription quotas and DeepSeek credit."""
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import subprocess
@@ -11,6 +12,23 @@ from collections import defaultdict, deque
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+
+
+def parse_args(argv=None):
+    """Parse the command line; argparse prints help/usage and exits itself."""
+    parser = argparse.ArgumentParser(
+        prog="quota-dash",
+        description="A live terminal dashboard for subscription quotas and "
+                    "DeepSeek credit.")
+    parser.add_argument(
+        "interval", nargs="?", type=int, default=60, metavar="SECONDS",
+        help="refresh interval in seconds (default: %(default)s)")
+    return parser.parse_args(argv)
+
+
+ARGS = parse_args()
+INTERVAL = ARGS.interval
+HISTORY_GAP_SECONDS = max(INTERVAL * 2.5, 5 * 60)
 
 try:
     from rich.align import Align
@@ -28,8 +46,6 @@ LEGACY_DEEPSEEK_AUTH = Path.home() / ".pi/agent/auth.json"
 DEEPSEEK_PEAK_HOURS_UTC = {1, 2, 3, 6, 7, 8, 9}   # double price in these windows
 HISTORY_FILE = Path(os.environ.get(
     "QUOTA_DASH_HISTORY", Path.home() / ".cache/quota-dash/history.jsonl"))
-INTERVAL = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 60
-HISTORY_GAP_SECONDS = max(INTERVAL * 2.5, 5 * 60)
 
 console = Console()
 

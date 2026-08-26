@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
+import select
+import signal
 import subprocess
 import sys
+import termios
 import time
+import tty
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -36,6 +41,7 @@ try:
     from rich.live import Live
     from rich.panel import Panel
     from rich.rule import Rule
+    from rich.segment import Segment
     from rich.table import Table
     from rich.text import Text
 except ImportError:
@@ -454,13 +460,151 @@ def frame():
     return render_dashboard(data, bal, avail, history, legacy_auth, now)
 
 
+class ScrollView:
+    """Render a full dashboard through a terminal-sized scrolling viewport."""
+
+    def __init__(self, content):
+        self.content = content
+        self.offset = 0
+        self.page_size = 1
+        self.max_offset = 0
+
+    def update(self, content):
+        self.content = content
+
+    def scroll(self, amount):
+        self.offset = min(self.max_offset, max(0, self.offset + amount))
+
+    def home(self):
+        self.offset = 0
+
+    def end(self):
+        self.offset = self.max_offset
+
+    def __rich_console__(self, rich_console, options):
+        height = options.height or rich_console.height
+        full = rich_console.render_lines(
+            self.content, options.update(height=None), pad=True)
+        total = len(full)
+        clipped = total > height
+        self.page_size = max(1, height - 1 if clipped else height)
+        self.max_offset = max(0, total - self.page_size)
+        self.offset = min(max(0, self.offset), self.max_offset)
+
+        for line in full[self.offset:self.offset + self.page_size]:
+            yield from line
+            yield Segment.line()
+
+        if clipped:
+            first = self.offset + 1
+            last = min(total, self.offset + self.page_size)
+            edges = (("↑" if self.offset else " ")
+                     + ("↓" if self.offset < self.max_offset else " "))
+            indicator = Text(
+                f" {edges} lines {first}–{last} of {total}"
+                " · ↑/↓ or j/k · PgUp/PgDn · Home/End",
+                style="reverse",
+                overflow="ellipsis",
+                no_wrap=True,
+            )
+            indicator_lines = rich_console.render_lines(
+                indicator, options.update(height=1), pad=True)
+            yield from indicator_lines[0]
+            yield Segment.line()
+
+
+KEYS = {
+    b"\x1b[A": "up",
+    b"\x1b[B": "down",
+    b"\x1b[5~": "page_up",
+    b"\x1b[6~": "page_down",
+    b"\x1b[H": "home",
+    b"\x1bOH": "home",
+    b"\x1b[1~": "home",
+    b"\x1b[7~": "home",
+    b"\x1b[F": "end",
+    b"\x1bOF": "end",
+    b"\x1b[4~": "end",
+    b"\x1b[8~": "end",
+    b"j": "down",
+    b"k": "up",
+}
+
+
+def read_key(fd, timeout):
+    """Read one terminal key, returning None when the refresh timer expires."""
+    try:
+        ready, _, _ = select.select([fd], [], [], max(0, timeout))
+    except InterruptedError:
+        return None
+    if not ready:
+        return None
+    key = os.read(fd, 32)
+    if key == b"\x03":
+        raise KeyboardInterrupt
+    return KEYS.get(key)
+
+
+@contextlib.contextmanager
+def terminal_keys(stream=sys.stdin):
+    """Put a terminal in cbreak mode and restore it on every exit path."""
+    fd = stream.fileno()
+    original_mode = termios.tcgetattr(fd)
+    original_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def exit_on_sigterm(_signum, _frame):
+        raise SystemExit(128 + signal.SIGTERM)
+
+    try:
+        signal.signal(signal.SIGTERM, exit_on_sigterm)
+        tty.setcbreak(fd)
+        yield fd
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, original_mode)
+        finally:
+            signal.signal(signal.SIGTERM, original_sigterm)
+
+
+def _apply_key(viewport, key):
+    if key == "up":
+        viewport.scroll(-1)
+    elif key == "down":
+        viewport.scroll(1)
+    elif key == "page_up":
+        viewport.scroll(-viewport.page_size)
+    elif key == "page_down":
+        viewport.scroll(viewport.page_size)
+    elif key == "home":
+        viewport.home()
+    elif key == "end":
+        viewport.end()
+
+
 def main():
     try:
-        with Live(frame(), console=console, refresh_per_second=4,
-                  screen=True) as view:
-            while True:
-                time.sleep(INTERVAL)
-                view.update(frame())
+        if not (sys.stdin.isatty() and console.is_terminal):
+            with Live(frame(), console=console, refresh_per_second=4,
+                      screen=True) as view:
+                while True:
+                    time.sleep(INTERVAL)
+                    view.update(frame())
+            return
+
+        viewport = ScrollView(frame())
+        with terminal_keys() as fd:
+            with Live(viewport, console=console, refresh_per_second=4,
+                      screen=True) as live:
+                next_refresh = time.monotonic() + INTERVAL
+                while True:
+                    key = read_key(fd, next_refresh - time.monotonic())
+                    if key:
+                        _apply_key(viewport, key)
+                        live.refresh()
+                    if time.monotonic() >= next_refresh:
+                        viewport.update(frame())
+                        live.refresh()
+                        next_refresh = time.monotonic() + INTERVAL
     except KeyboardInterrupt:
         pass
 

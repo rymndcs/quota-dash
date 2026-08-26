@@ -39,8 +39,11 @@ dashboard. The optional argument is the refresh interval in seconds (default:
 ./quota-dash 30
 ```
 
-Exit with Ctrl+C. Keep the virtual environment active when running the script,
-or install `rich` into whichever Python environment resolves as `python3`.
+When the dashboard is taller than the terminal, scroll with Up/Down (or `k`/`j`),
+PgUp/PgDn, and Home/End. The position bar at the bottom shows which lines are
+visible. Exit with Ctrl+C. Keep the virtual environment active when running the
+script, or install `rich` into whichever Python environment resolves as
+`python3`.
 
 ## Providers and credentials
 

@@ -234,6 +234,41 @@ def span(hours):
     return f"{hours / 24:.1f}d"
 
 
+def _is_stale(provider):
+    """True when a provider's data is marked not-current by quota-axi."""
+    state = provider.get("state")
+    if not isinstance(state, dict):
+        return False
+    if state.get("stale") is True:
+        return True
+    status = state.get("status")
+    return isinstance(status, str) and status != "fresh"
+
+
+def _plain_count(value):
+    """Format a credit count without a currency symbol or unit."""
+    if isinstance(value, float) and value.is_integer():
+        return f"{int(value):,}"
+    if isinstance(value, int):
+        return f"{value:,}"
+    return f"{value:g}"
+
+
+def _credit_row(provider):
+    """Return the rendered credit value for a provider, or None when absent."""
+    credits = provider.get("credits")
+    if not isinstance(credits, dict):
+        return None
+    if credits.get("unlimited") is True:
+        return Text("unlimited")
+    remaining = credits.get("remaining")
+    if isinstance(remaining, (int, float)):
+        if credits.get("unit") == "usd":
+            return Text(f"${remaining:,.2f}")
+        return Text(_plain_count(remaining))
+    return Text("—", style="dim")
+
+
 def gauge(pct, width=26):
     pct = max(0.0, min(100.0, float(pct)))
     filled = round(width * pct / 100)
@@ -268,14 +303,16 @@ def windows_table(live_providers, now=None):
     t.add_column()
 
     rows = []
+    shown = False
     now = now or datetime.now().astimezone()
     for p in live_providers:
         prov = (p.get("provider") or "?").capitalize()
+        stale = _is_stale(p)
         for w in p.get("windows", []):
             pct = w.get("percentRemaining")
             if not isinstance(pct, (int, float)):
                 continue
-            rows.append((prov, w))
+            rows.append((prov, w, stale))
             label = f"{prov} {(w.get('label') or w.get('id') or '')}".strip()
             reset = as_local(w.get("resetsAt"))
             when = Text()
@@ -283,9 +320,32 @@ def windows_table(live_providers, now=None):
                 hrs = (reset - now).total_seconds() / 3600
                 stamp = reset.strftime("%H:%M") if hrs < 24 else reset.strftime("%a %H:%M")
                 when.append(stamp)
-                when.append(f"   in {span(hrs)}", style="dim")
+                if hrs < 0:
+                    when.append("   reset passed", style="dim")
+                else:
+                    when.append(f"   in {span(hrs)}", style="dim")
             t.add_row(label, dot(pct), gauge(pct), f"{pct:.1f}%", when)
-    if not rows:
+            shown = True
+        credit = _credit_row(p)
+        if credit is not None:
+            t.add_row(f"{prov} credits", "", credit, "", "")
+            shown = True
+        if stale:
+            state = p.get("state") or {}
+            status = state.get("status")
+            mark = status if isinstance(status, str) and status != "fresh" else "stale"
+            age_text = ""
+            refreshed = as_local(state.get("refreshedAt"))
+            if refreshed:
+                age = max(0.0, (now - refreshed).total_seconds() / 3600)
+                age_text = f"{span(age)} old"
+            error = state.get("error")
+            error_text = error if isinstance(error, str) and error else ""
+            t.add_row(Text(f"↻ {mark}", style="yellow"), "",
+                      Text(age_text, style="dim"), "",
+                      Text(error_text, style="dim"))
+            shown = True
+    if not shown:
         t.add_row(Text("no window data", style="dim"), "", "", "", "")
     return t, rows
 
@@ -300,7 +360,7 @@ def pace_table(rows, now=None):
     t.add_column("🔮 Prediction")
 
     now = now or datetime.now().astimezone()
-    for prov, w in rows:
+    for prov, w, stale in rows:
         label = f"{prov} {(w.get('label') or w.get('id') or '')}".strip()
         pace = w.get("pace") if isinstance(w.get("pace"), dict) else {}
 
@@ -317,8 +377,13 @@ def pace_table(rows, now=None):
 
         out = as_local(pace.get("projectedExhaustedAt"))
         reset = as_local(w.get("resetsAt"))
+        elapsed = reset is not None and (reset - now).total_seconds() < 0
         right = Text()
-        if out and reset and out < reset:
+        if stale and not elapsed:
+            right.append("no projection", style="dim")
+        elif elapsed:
+            right.append("reset passed", style="dim")
+        elif out and reset and out < reset:
             early = (reset - out).total_seconds() / 3600
             right.append(f"runs dry {out.strftime('%a %H:%M')}", style="red")
             right.append(f"  ·  {span(early)} early", style="dim")
@@ -402,9 +467,11 @@ def deepseek_history_table(records):
 def render_dashboard(data, bal, avail, history, legacy_auth=False, now=None):
     """Build a dashboard from supplied data (also used by the SVG renderer)."""
     now = now or datetime.now().astimezone()
-    live = [p for p in data.get("providers", []) if p.get("source") != "unavailable"]
-    asleep = [p.get("provider") for p in data.get("providers", [])
+    providers = data.get("providers", [])
+    live = [p for p in providers if p.get("source") != "unavailable"]
+    asleep = [p.get("provider") for p in providers
               if p.get("source") == "unavailable"]
+    stale = [p for p in live if _is_stale(p)]
 
     wtable, rows = windows_table(live, now)
     tag = "  ·  ".join(f"{p.get('provider')} {p.get('plan', '')}".strip() for p in live)
@@ -431,7 +498,10 @@ def render_dashboard(data, bal, avail, history, legacy_auth=False, now=None):
 
     foot = Text()
     foot.append(f"⏰ {now.strftime('%H:%M:%S')}   ")
-    foot.append(f"📡 {len(live)} live", style="green")
+    foot.append(f"📡 {len(live) - len(stale)} live", style="green")
+    if stale:
+        foot.append(f"   ⚠ {', '.join(p.get('provider') for p in stale)} stale",
+                    style="yellow")
     if asleep:
         foot.append(f"   💤 {', '.join(asleep)}", style="dim")
     foot.append(f"   refresh {INTERVAL}s · Ctrl+C to exit", style="dim")

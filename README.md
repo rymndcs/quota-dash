@@ -1,9 +1,11 @@
 # quota-dash
 
 `quota-dash` is a live terminal dashboard for the capacity available across
-your AI coding providers. It puts rolling subscription limits, pace and reset
-times next to a DeepSeek prepaid balance, so one glance answers both “how much
-room is left?” and “where should the next job run?”
+your AI coding providers. It puts rolling subscription limits, per-provider
+credit balances, pace and reset times next to a DeepSeek prepaid balance, so
+one glance answers both “how much room is left?” and “where should the next
+job run?” Providers whose figures come from a stale cache stay on screen but
+are marked as not current.
 
 ![quota-dash terminal dashboard](assets/quota-dash.svg)
 
@@ -50,7 +52,14 @@ script, or install `rich` into whichever Python environment resolves as
 `quota-axi` supplies the subscription providers it supports, including Claude,
 Codex, Cursor, Copilot, Grok and Kimi. Their limits are rolling windows: the
 dashboard shows remaining percentages, reset times, burn pace and whether the
-current pace is likely to exhaust a window early.
+current pace is likely to exhaust a window early. Providers that report a
+credit balance (Codex does) get a credits row directly under their windows,
+rendered as a plain count, a dollar amount, or `unlimited`, whichever
+`quota-axi` reports.
+
+A provider whose data comes from `quota-axi`'s cache rather than a fresh read
+is still shown, but it is marked with the age of its data and any reported
+error, and it is not counted in the footer's live tally.
 
 DeepSeek is different. It is pay-as-you-go rather than a subscription window,
 so `quota-dash` calls DeepSeek's balance endpoint directly and shows the

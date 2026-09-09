@@ -39,6 +39,7 @@ QUOTAS = {
             "provider": "codex",
             "plan": "Plus",
             "source": "live",
+            "credits": {"remaining": 120, "unlimited": False, "unit": "credits"},
             "windows": [
                 {
                     "id": "five-hour",
@@ -58,6 +59,25 @@ QUOTAS = {
                     "pace": {"burnMultiple": 0.94},
                 },
             ],
+        },
+        {
+            "provider": "grok",
+            "plan": "SuperGrok",
+            "source": "cache",
+            "credits": {"remaining": 25, "unlimited": False, "unit": "usd"},
+            "state": {
+                "status": "stale",
+                "stale": True,
+                "refreshedAt": "2026-08-06T10:00:00Z",
+                "error": "Grok sign-in required",
+            },
+            "windows": [{
+                "id": "weekly",
+                "label": "Weekly",
+                "percentRemaining": 41.0,
+                "resetsAt": "2026-08-08T02:00:00Z",
+                "pace": {"status": "unknown", "reason": "stale"},
+            }],
         },
         {"provider": "kimi", "source": "unavailable", "windows": []},
     ]

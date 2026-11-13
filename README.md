@@ -61,6 +61,22 @@ A provider whose data comes from `quota-axi`'s cache rather than a fresh read
 is still shown, but it is marked with the age of its data and any reported
 error, and it is not counted in the footer's live tally.
 
+If `quota-axi --json` has no usable Claude window reading (including a
+rate-limited or unavailable Claude provider), `quota-dash` optionally reads
+omp's saved usage from `~/.omp/agent/agent.db`. It takes the latest reading per
+Claude limit and account, keeping accounts separate and identifying them on
+screen. Each window is labelled `omp` with its own reading age. These saved
+readings stay marked stale, are excluded from the live tally, and have no pace
+projection. A usable quota-axi reading, including its labelled cache, takes
+precedence.
+
+omp is not required. Its internal schema is unstable: a missing, unreadable,
+busy, locked or incompatible database is silently ignored for that refresh,
+leaving the existing quota-axi display unchanged. Each refresh opens SQLite
+with `mode=ro` and a short timeout, reads, and closes the connection; the
+dashboard does not write usage data, change the schema or migrate the
+database. Normal SQLite reader locks are used briefly during the query.
+
 DeepSeek is different. It is pay-as-you-go rather than a subscription window,
 so `quota-dash` calls DeepSeek's balance endpoint directly and shows the
 remaining USD credit and observed usage/top-ups. DeepSeek is optional: with no

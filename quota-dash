@@ -8,6 +8,7 @@ import json
 import os
 import select
 import signal
+import sqlite3
 import subprocess
 import sys
 import termios
@@ -61,9 +62,84 @@ def read_quota():
     try:
         out = subprocess.run(["quota-axi", "--json"], capture_output=True,
                              text=True, timeout=45).stdout
-        return json.loads(out)
+        data = json.loads(out)
     except Exception:
         return None
+    providers = data.get("providers", [])
+    for provider in providers:
+        if (provider.get("provider") == "claude"
+                and provider.get("source") != "unavailable"
+                and (provider.get("state") or {}).get("status") != "rate_limited"
+                and any(isinstance(w.get("percentRemaining"), (int, float))
+                        and 0 <= w["percentRemaining"] <= 100
+                        for w in provider.get("windows", []))):
+            return data
+    fallback = read_omp_claude()
+    if not fallback:
+        return data
+    return {**data, "providers": [p for p in providers
+                                 if p.get("provider") != "claude"] + fallback}
+
+
+def read_omp_claude():
+    path = Path.home() / ".omp/agent/agent.db"
+    try:
+        with contextlib.closing(sqlite3.connect(
+                path.as_uri() + "?mode=ro", uri=True, timeout=0.05)) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("""
+                SELECT h.account_key, h.account_id, h.email, h.limit_id,
+                       h.label, h.window_label, h.used_fraction,
+                       h.recorded_at, h.resets_at
+                FROM usage_history AS h
+                WHERE h.provider = 'anthropic' AND NOT EXISTS (
+                    SELECT 1 FROM usage_history AS newer
+                    WHERE newer.provider = h.provider
+                      AND newer.account_key = h.account_key
+                      AND newer.limit_id = h.limit_id
+                      AND (newer.recorded_at > h.recorded_at
+                           OR (newer.recorded_at = h.recorded_at AND newer.id > h.id))
+                )
+                ORDER BY h.account_key, h.limit_id
+            """).fetchall()
+    except (OSError, sqlite3.Error):
+        return []
+
+    accounts = {}
+    for row in rows:
+        try:
+            used = row["used_fraction"]
+            if not 0 <= used <= 1:
+                continue
+            recorded = datetime.fromtimestamp(row["recorded_at"] / 1000, timezone.utc)
+            reset = (datetime.fromtimestamp(row["resets_at"] / 1000, timezone.utc)
+                     if row["resets_at"] is not None else None)
+            key = row["account_key"]
+            if not isinstance(key, str) or not key:
+                continue
+            label = row["label"] or row["window_label"] or row["limit_id"]
+            if not isinstance(label, str):
+                continue
+            if label.startswith("Claude "):
+                label = label[len("Claude "):]
+            provider = accounts.setdefault(key, {
+                "provider": "claude", "source": "omp",
+                "plan": row["email"] or key,
+                "account": {"accountId": row["account_id"] or key,
+                            "accountKey": key, "email": row["email"]},
+                "state": {"status": "omp", "stale": True,
+                          "error": f"account: {key}"},
+                "windows": [],
+            })
+            provider["windows"].append({
+                "id": row["limit_id"], "label": label,
+                "percentRemaining": (1 - used) * 100,
+                "resetsAt": reset.isoformat() if reset else None,
+                "recordedAt": recorded.isoformat(),
+            })
+        except (TypeError, ValueError, OverflowError, OSError):
+            continue
+    return list(accounts.values())
 
 
 def _balance(value):
@@ -324,6 +400,10 @@ def windows_table(live_providers, now=None):
                     when.append("   reset passed", style="dim")
                 else:
                     when.append(f"   in {span(hrs)}", style="dim")
+            if p.get("source") == "omp":
+                recorded = as_local(w.get("recordedAt"))
+                age = max(0.0, (now - recorded).total_seconds() / 3600)
+                when.append(f"   omp · {span(age)} old", style="yellow")
             t.add_row(label, dot(pct), gauge(pct), f"{pct:.1f}%", when)
             shown = True
         credit = _credit_row(p)

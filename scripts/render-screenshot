@@ -25,16 +25,14 @@ QUOTAS = {
     "providers": [
         {
             "provider": "claude",
-            "plan": "demo@example.test",
-            "source": "omp",
-            "state": {"status": "omp", "stale": True,
-                      "error": "account: demo-account"},
+            "plan": "Max",
+            "source": "live",
             "windows": [{
                 "id": "five-hour",
                 "label": "5-hour",
                 "percentRemaining": 72.4,
                 "resetsAt": "2026-08-08T15:30:00Z",
-                "recordedAt": "2026-08-08T11:30:00Z",
+                "pace": {"burnMultiple": 0.81},
             }],
         },
         {

@@ -36,6 +36,7 @@ SCHEMA = """CREATE TABLE usage_history (
 
 class OmpFallbackTest(unittest.TestCase):
     def setUp(self):
+        (ROOT / ".cache").mkdir(exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(dir=ROOT / ".cache")
         self.addCleanup(self.temp.cleanup)
         self.path = Path(self.temp.name) / "agent.db"
@@ -118,6 +119,85 @@ class OmpFallbackTest(unittest.TestCase):
                 result = self.read(data)
                 self.assertEqual("omp", result["providers"][0]["source"])
                 self.assertEqual(75, result["providers"][0]["windows"][0]["percentRemaining"])
+
+    def test_null_samples_do_not_hide_latest_non_null_limit_readings(self):
+        conn = self.database()
+        self.save(conn, fraction=0.25)
+        self.save(conn, fraction=0.9, age=7200000)
+        self.save(conn, fraction=0.6, limit="anthropic:5h", label="Claude 5 Hour")
+        self.save(conn, fraction=0.1, account="account-b")
+        self.save(conn, fraction=None, account="only-null")
+        for age in (3600000, 3599000):
+            with self.subTest(null_age=age):
+                self.save(conn, fraction=None, age=age)
+                data = self.read()
+                readings = {p["account"]["accountId"]: p["windows"]
+                            for p in data["providers"] if p["provider"] == "claude"}
+                self.assertEqual({"account-a", "account-b"}, set(readings))
+                self.assertEqual({"anthropic:5h": 40, "anthropic:7d": 75},
+                                 {w["id"]: w["percentRemaining"]
+                                  for w in readings["account-a"]})
+                self.assertEqual(90, readings["account-b"][0]["percentRemaining"])
+                text = self.render(data)
+                self.assertIn("75.0%", text)
+                self.assertIn("40.0%", text)
+
+    def test_history_query_stays_within_linear_work_budget(self):
+        conn = self.database()
+        conn.execute("CREATE INDEX idx_usage_history_series ON usage_history "
+                     "(provider, account_key, limit_id, recorded_at)")
+        conn.execute("CREATE INDEX idx_usage_history_recorded ON usage_history (recorded_at)")
+        conn.executemany("""INSERT INTO usage_history
+            (recorded_at, provider, account_key, limit_id, label, used_fraction)
+            VALUES (?, 'anthropic', 'account-a', 'anthropic:7d', 'Claude 7 Day', .25)
+            """, ((STAMP + i,) for i in range(4000)))
+        conn.commit()
+        real_connect = sqlite3.connect
+        steps = 0
+
+        def progress():
+            nonlocal steps
+            steps += 1000
+            return int(steps >= 1000000)
+
+        def connect(*args, **kwargs):
+            connection = real_connect(*args, **kwargs)
+            connection.set_progress_handler(progress, 1000)
+            return connection
+
+        with patch.object(sqlite3, "connect", side_effect=connect):
+            data = self.read()
+        self.assertLess(steps, 1000000, "latest-limit query exhausted its VM work budget")
+        claude = [p for p in data["providers"] if p["provider"] == "claude"]
+        self.assertEqual("omp", claude[0]["source"])
+        self.assertEqual(75, claude[0]["windows"][0]["percentRemaining"])
+
+    def test_json_null_keeps_frame_error_panel_even_with_saved_usage(self):
+        conn = self.database()
+        self.save(conn)
+        with patch.object(dash.subprocess, "run", return_value=SimpleNamespace(stdout="null")), \
+                patch.object(dash, "read_deepseek", return_value=("unconfigured", "", False)), \
+                patch.object(dash, "load_history", return_value=[]):
+            out = io.StringIO()
+            Console(file=out, width=160, color_system=None).print(dash.frame())
+        self.assertIn("quota-axi returned nothing readable", out.getvalue())
+        self.assertNotIn("omp", out.getvalue())
+
+    def test_string_state_preserves_usable_claude_and_frame(self):
+        conn = self.database()
+        self.save(conn)
+        data = {"providers": [{"provider": "claude", "source": "oauth",
+                "state": "fresh", "windows": [{"id": "weekly", "percentRemaining": 90}]}]}
+        with patch.object(dash.subprocess, "run", return_value=SimpleNamespace(
+                stdout=json.dumps(data))), \
+                patch.object(dash, "read_deepseek", return_value=("unconfigured", "", False)), \
+                patch.object(dash, "load_history", return_value=[]):
+            out = io.StringIO()
+            Console(file=out, width=160, color_system=None).print(dash.frame())
+        self.assertIn("90.0%", out.getvalue())
+        self.assertIn("1 live", out.getvalue())
+        self.assertNotIn("omp", out.getvalue())
+        self.assertEqual(data, self.read(data))
 
     def test_missing_claude_provider_falls_back(self):
         conn = self.database()

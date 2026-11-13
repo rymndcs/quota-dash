@@ -65,11 +65,15 @@ def read_quota():
         data = json.loads(out)
     except Exception:
         return None
+    if data is None:
+        return None
     providers = data.get("providers", [])
     for provider in providers:
+        state = provider.get("state")
+        state = state if isinstance(state, dict) else {}
         if (provider.get("provider") == "claude"
                 and provider.get("source") != "unavailable"
-                and (provider.get("state") or {}).get("status") != "rate_limited"
+                and state.get("status") != "rate_limited"
                 and any(isinstance(w.get("percentRemaining"), (int, float))
                         and 0 <= w["percentRemaining"] <= 100
                         for w in provider.get("windows", []))):
@@ -88,19 +92,20 @@ def read_omp_claude():
                 path.as_uri() + "?mode=ro", uri=True, timeout=0.05)) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute("""
-                SELECT h.account_key, h.account_id, h.email, h.limit_id,
-                       h.label, h.window_label, h.used_fraction,
-                       h.recorded_at, h.resets_at
-                FROM usage_history AS h
-                WHERE h.provider = 'anthropic' AND NOT EXISTS (
-                    SELECT 1 FROM usage_history AS newer
-                    WHERE newer.provider = h.provider
-                      AND newer.account_key = h.account_key
-                      AND newer.limit_id = h.limit_id
-                      AND (newer.recorded_at > h.recorded_at
-                           OR (newer.recorded_at = h.recorded_at AND newer.id > h.id))
+                SELECT account_key, account_id, email, limit_id,
+                       label, window_label, used_fraction, recorded_at, resets_at
+                FROM (
+                    SELECT account_key, account_id, email, limit_id,
+                           label, window_label, used_fraction, recorded_at, resets_at,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY account_key, limit_id
+                               ORDER BY recorded_at DESC, id DESC
+                           ) AS reading_rank
+                    FROM usage_history
+                    WHERE provider = 'anthropic' AND used_fraction IS NOT NULL
                 )
-                ORDER BY h.account_key, h.limit_id
+                WHERE reading_rank = 1
+                ORDER BY account_key, limit_id
             """).fetchall()
     except (OSError, sqlite3.Error):
         return []

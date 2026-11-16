@@ -57,9 +57,25 @@ credit balance (Codex does) get a credits row directly under their windows,
 rendered as a plain count, a dollar amount, or `unlimited`, whichever
 `quota-axi` reports.
 
-A provider whose data comes from `quota-axi`'s cache rather than a fresh read
-is still shown, but it is marked with the age of its data and any reported
-error, and it is not counted in the footer's live tally.
+When a provider refresh fails, `quota-dash` keeps its last successful windows
+and credits on screen. A yellow `↻ stale` row shows the age of the reading and
+`not updating` with the reported error. Healthy providers continue updating;
+cached providers are excluded from the live tally and have no burn-rate or
+exhaustion prediction. Fresh data automatically replaces the saved reading
+and clears the warning.
+
+Successful subscription readings are saved in
+`~/.cache/quota-dash/quotas.json` (override with `QUOTA_DASH_CACHE`) so fallback
+also works after restarting the dashboard or when the entire `quota-axi`
+command fails. Only successful readings replace this cache. If saving fails,
+fallback still works in memory for the current process. With no previous
+successful reading, no quota is invented.
+
+Last-valid readings are historical, not estimates of current capacity. They
+remain visible until replaced, even after a reset time passes; the dashboard
+labels those reset times `reset passed`. Usable live readings and
+`quota-axi`'s own labelled cache always take precedence over dashboard-owned
+and omp readings.
 
 If `quota-axi --json` has no usable Claude window reading (including a
 rate-limited or unavailable Claude provider), `quota-dash` optionally reads
@@ -67,8 +83,11 @@ omp's saved usage from `~/.omp/agent/agent.db`. It takes the latest reading per
 Claude limit and account, keeping accounts separate and identifying them on
 screen. Each window is labelled `omp` with its own reading age. These saved
 readings stay marked stale, are excluded from the live tally, and have no pace
-projection. A usable quota-axi reading, including its labelled cache, takes
-precedence.
+projection. When both omp and the dashboard's last-good Claude snapshot are
+available, the newer reading wins for each matching account and window, comparing omp's
+`recordedAt` with the snapshot's `state.refreshedAt`. The dashboard keeps the
+chosen source's stale label and reading age. A usable quota-axi reading,
+including its labelled cache, takes precedence over both.
 
 omp is not required. Its internal schema is unstable: a missing, unreadable,
 busy, locked or incompatible database is silently ignored for that refresh,
@@ -105,6 +124,13 @@ Every successful DeepSeek refresh appends the three USD balance components to
 Set `QUOTA_DASH_HISTORY` to override that location. The default file is created
 with mode `0600` inside a mode `0700` directory; history, credentials and local
 caches are gitignored.
+
+If the DeepSeek balance API fails, the last saved successful balance remains
+visible with a yellow stale warning, its age, and `balance unreachable`. Cached
+balances never create new history samples or assert current availability.
+Removing the key still shows `no key configured` rather than a saved balance.
+The subscription snapshot file also uses mode `0600` and atomic replacement;
+it stores provider readings, not credentials.
 
 The history math deliberately treats the two provider models differently:
 

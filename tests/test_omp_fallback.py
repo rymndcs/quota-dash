@@ -45,6 +45,10 @@ class OmpFallbackTest(unittest.TestCase):
         self.addCleanup(self.home.stop)
         (Path(self.temp.name) / ".omp/agent").mkdir(parents=True)
         self.path = Path(self.temp.name) / ".omp/agent/agent.db"
+        self.cache = dash.QuotaCache(Path(self.temp.name) / "quotas.json")
+        cache_patch = patch.object(dash, "QUOTA_CACHE", self.cache)
+        cache_patch.start()
+        self.addCleanup(cache_patch.stop)
         self.data = {"providers": [copy.deepcopy(FAILED), copy.deepcopy(CODEX)]}
 
     def database(self, wal=False):
@@ -315,6 +319,119 @@ class OmpFallbackTest(unittest.TestCase):
         self.assertIn("no projection", text)
         self.assertIn("omp", text)
         self.assertNotIn("lasts through reset", text)
+
+    def cached_claude(self, stamp="2026-11-14T11:30:00+00:00"):
+        provider = {
+            "provider": "claude", "source": "oauth",
+            "account": {"accountId": "account-a", "email": "account-a@example.test"},
+            "windows": [
+                {"id": "five_hour", "label": "session", "percentRemaining": 72},
+                {"id": "seven_day", "label": "week", "percentRemaining": 64}],
+            "state": {"status": "fresh", "stale": False, "refreshedAt": stamp}}
+        self.cache.update({"providers": [provider]}, now=NOW)
+        return provider
+
+    def test_newest_saved_reading_wins_for_each_claude_window(self):
+        conn = self.database()
+        original = self.cached_claude()
+        original["windows"].extend([
+            {"id": "model:fable", "label": "Fable", "percentRemaining": 22},
+            {"id": "seven_day_opus", "label": "Opus", "percentRemaining": 33}])
+        self.cache.update({"providers": [original]}, now=NOW)
+        self.save(conn, fraction=0.6, age=600000, limit="anthropic:5h", label="Claude 5 Hour")
+        self.save(conn, fraction=0.75, age=3600000)
+        self.save(conn, fraction=0.9, age=3600000, limit="anthropic:7d:fable")
+        self.save(conn, fraction=0.9, age=3600000, limit="anthropic:7d:opus")
+        result = self.read()
+        claude = [p for p in result["providers"] if p["provider"] == "claude"]
+        windows = {w["id"]: (w["percentRemaining"], p["source"])
+                   for p in claude for w in p["windows"]}
+        self.assertEqual({"anthropic:5h": (40, "omp"),
+                          "seven_day": (64, "quota-dash-cache"),
+                          "model:fable": (22, "quota-dash-cache"),
+                          "seven_day_opus": (33, "quota-dash-cache")}, windows)
+        text = self.render(result)
+        self.assertIn("40.0%", text)
+        self.assertIn("64.0%", text)
+        self.assertIn("omp", text)
+        self.assertIn("not updating", text)
+        self.assertIn("no projection", text)
+        self.assertEqual(72, self.cache.providers[("claude", "account-a")]["windows"][0]["percentRemaining"])
+
+    def test_newer_dashboard_cache_survives_restart_and_omp_comparison(self):
+        conn = self.database()
+        self.cached_claude("2026-11-14T20:00:00+08:00")
+        self.save(conn, age=600000)
+        restarted = dash.QuotaCache(self.cache.path)
+        with patch.object(dash, "QUOTA_CACHE", restarted):
+            result = self.read()
+        claude = [p for p in result["providers"] if p["provider"] == "claude"]
+        self.assertEqual(1, len(claude))
+        self.assertEqual("quota-dash-cache", claude[0]["source"])
+        self.assertEqual([72, 64], [w["percentRemaining"] for w in claude[0]["windows"]])
+        self.assertTrue(claude[0]["state"]["stale"])
+
+    def test_usable_quota_axi_live_and_own_cache_beat_newer_saved_fallbacks(self):
+        conn = self.database()
+        original = self.cached_claude()
+        self.save(conn, age=0)
+        for source, status in (("oauth", "fresh"), ("cache", "stale")):
+            with self.subTest(source=source):
+                self.cache.update({"providers": [original]}, now=NOW)
+                upstream = copy.deepcopy(original)
+                upstream["source"] = source
+                upstream["state"].update(status=status, stale=status == "stale",
+                                         refreshedAt="2026-11-14T01:00:00Z")
+                upstream["windows"][0]["percentRemaining"] = 90
+                result = self.read({"providers": [upstream]})
+                self.assertEqual([upstream], result["providers"])
+
+    def test_saved_readings_do_not_replace_another_claude_account(self):
+        conn = self.database()
+        self.cached_claude()
+        self.save(conn, fraction=0.2, account="account-b", age=3600000)
+        result = self.read()
+        readings = {p["account"]["accountId"]: p for p in result["providers"]
+                    if p["provider"] == "claude"}
+        self.assertEqual({"account-a", "account-b"}, set(readings))
+        self.assertEqual(72, readings["account-a"]["windows"][0]["percentRemaining"])
+        self.assertEqual(80, readings["account-b"]["windows"][0]["percentRemaining"])
+
+    def test_anonymous_last_good_snapshot_compares_with_single_omp_account(self):
+        conn = self.database()
+        original = self.cached_claude()
+        del original["account"]
+        self.cache = dash.QuotaCache(self.cache.path.parent / "anonymous.json")
+        self.cache.update({"providers": [original]}, now=NOW)
+        self.save(conn, fraction=0.6, age=600000, limit="anthropic:5h")
+        self.save(conn, fraction=0.75, age=600000)
+        with patch.object(dash, "QUOTA_CACHE", self.cache):
+            result = self.read()
+        claude = [p for p in result["providers"] if p["provider"] == "claude"]
+        self.assertEqual(1, len(claude))
+        self.assertEqual("omp", claude[0]["source"])
+        self.assertEqual([40, 25], [w["percentRemaining"] for w in claude[0]["windows"]])
+
+    def test_saved_credits_remain_visible_when_newer_omp_windows_win(self):
+        conn = self.database()
+        original = self.cached_claude()
+        original["credits"] = {"remaining": 42, "unit": "credits"}
+        self.cache.update({"providers": [original]}, now=NOW)
+        self.save(conn, fraction=0.6, age=600000, limit="anthropic:5h")
+        self.save(conn, fraction=0.75, age=600000)
+        result = self.read()
+        claude = [p for p in result["providers"] if p["provider"] == "claude"]
+        self.assertEqual([42], [p["credits"]["remaining"] for p in claude if "credits" in p])
+        self.assertEqual(2, sum(len(p["windows"]) for p in claude))
+        self.assertIn("Claude credits", self.render(result))
+
+    def test_command_failure_uses_saved_quota_without_changing_omp_only_behavior(self):
+        self.cached_claude()
+        with patch.object(dash.subprocess, "run", side_effect=OSError("no quota-axi")):
+            result = dash.read_quota()
+        claude = result["providers"][0]
+        self.assertEqual(72, claude["windows"][0]["percentRemaining"])
+        self.assertTrue(claude["state"]["stale"])
 
     def test_frame_renders_fallback_without_new_error_banner(self):
         conn = self.database()

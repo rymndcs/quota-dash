@@ -11,6 +11,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import termios
 import time
 import tty
@@ -53,36 +54,181 @@ LEGACY_DEEPSEEK_AUTH = Path.home() / ".pi/agent/auth.json"
 DEEPSEEK_PEAK_HOURS_UTC = {1, 2, 3, 6, 7, 8, 9}   # double price in these windows
 HISTORY_FILE = Path(os.environ.get(
     "QUOTA_DASH_HISTORY", Path.home() / ".cache/quota-dash/history.jsonl"))
+QUOTA_CACHE_FILE = Path(os.environ.get(
+    "QUOTA_DASH_CACHE", Path.home() / ".cache/quota-dash/quotas.json"))
 
 console = Console()
 
 
 # ---------------------------------------------------------------- data reads
-def read_quota():
-    try:
-        out = subprocess.run(["quota-axi", "--json"], capture_output=True,
-                             text=True, timeout=45).stdout
-        data = json.loads(out)
-    except Exception:
-        return None
-    if data is None:
-        return None
-    providers = data.get("providers", [])
-    for provider in providers:
+class QuotaCache:
+    """Keep successful provider readings separate from failed refreshes."""
+
+    def __init__(self, path=None):
+        self.path = path or QUOTA_CACHE_FILE
+        self.providers = {}
+        try:
+            saved = json.loads(self.path.read_text())
+            if self.valid_report(saved):
+                self.providers = {
+                    self.key(p): p for p in saved["providers"] if self.fresh(p)}
+        except (OSError, ValueError):
+            pass
+
+    @staticmethod
+    def valid_report(data):
+        return (isinstance(data, dict)
+                and isinstance(data.get("providers"), list)
+                and all(isinstance(p, dict)
+                        and isinstance(p.get("provider"), str)
+                        and isinstance(p.get("windows", []), list)
+                        and all(isinstance(w, dict) for w in p.get("windows", []))
+                        for p in data["providers"]))
+
+    @staticmethod
+    def key(provider):
+        identity = provider.get("account")
+        identity = identity if isinstance(identity, dict) else {}
+        account = identity.get("accountId") or identity.get("accountKey") or provider.get("accountKey")
+        if not isinstance(account, str) or not account:
+            accounts = provider.get("accountKeys")
+            account = (accounts[0] if isinstance(accounts, list) and accounts
+                       and isinstance(accounts[0], str) else "default")
+        return provider["provider"], account
+
+    @staticmethod
+    def fresh(provider):
         state = provider.get("state")
-        state = state if isinstance(state, dict) else {}
-        if (provider.get("provider") == "claude"
-                and provider.get("source") != "unavailable"
-                and state.get("status") != "rate_limited"
-                and any(isinstance(w.get("percentRemaining"), (int, float))
-                        and 0 <= w["percentRemaining"] <= 100
-                        for w in provider.get("windows", []))):
-            return data
+        return (isinstance(state, dict)
+                and provider.get("source") not in ("unavailable", "cache")
+                and state.get("status") == "fresh"
+                and not state.get("stale")
+                and (not provider.get("windows") or usable_windows(provider)))
+
+    def update(self, data, error="quota-axi returned no readable data", now=None):
+        now = now or datetime.now(timezone.utc)
+        if data is None and not self.providers:
+            return None
+        current = {self.key(p): p for p in data["providers"]} if data else {}
+        reports = []
+        changed = False
+        for name in dict.fromkeys([*current, *self.providers]):
+            provider = current.get(name)
+            if provider is not None and self.fresh(provider):
+                state = {**provider["state"],
+                         "refreshedAt": provider["state"].get("refreshedAt") or now.isoformat()}
+                self.providers[name] = {**provider, "state": state}
+                changed = True
+            elif provider is not None and usable_windows(provider):
+                pass
+            elif name in self.providers:
+                saved = self.providers[name]
+                failure = provider.get("state") if provider is not None else {}
+                failure = failure if isinstance(failure, dict) else {}
+                reason = failure.get("error") or failure.get("status")
+                if not reason:
+                    reason = error if data is None else "provider missing from quota-axi response"
+                provider = {
+                    **saved, "source": "quota-dash-cache",
+                    "state": {**saved["state"], "status": "stale", "stale": True,
+                              "error": reason},
+                }
+            reports.append(provider)
+        if changed:
+            self.save()
+        return {**(data or {}), "providers": reports}
+
+    def save(self):
+        temporary = None
+        try:
+            self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                    mode="w", dir=self.path.parent, delete=False) as stream:
+                temporary = Path(stream.name)
+                json.dump({"providers": list(self.providers.values())}, stream)
+                stream.write("\n")
+            temporary.replace(self.path)
+        except OSError:
+            pass
+        finally:
+            if temporary is not None:
+                with contextlib.suppress(OSError):
+                    temporary.unlink(missing_ok=True)
+
+
+def usable_windows(provider):
+    state = provider.get("state")
+    state = state if isinstance(state, dict) else {}
+    return (provider.get("source") != "unavailable"
+            and state.get("status") != "rate_limited"
+            and any(isinstance(w.get("percentRemaining"), (int, float))
+                    and 0 <= w["percentRemaining"] <= 100
+                    for w in provider.get("windows", [])))
+
+
+QUOTA_CACHE = QuotaCache()
+
+
+def read_quota():
+    data = None
+    error = "quota-axi returned invalid or unreadable data"
+    try:
+        result = subprocess.run(["quota-axi", "--json"], capture_output=True,
+                                text=True, timeout=45)
+        candidate = json.loads(result.stdout)
+        if QuotaCache.valid_report(candidate):
+            data = candidate
+    except subprocess.TimeoutExpired:
+        error = "quota-axi timed out after 45s"
+    except OSError as failure:
+        error = f"quota-axi unavailable: {failure.strerror}"
+    except ValueError:
+        pass
+    cached = QUOTA_CACHE.update(data, error=error)
+    if cached is None:
+        return None
+    if data and any(p.get("provider") == "claude" and usable_windows(p)
+                    for p in data["providers"]):
+        return cached
     fallback = read_omp_claude()
     if not fallback:
-        return data
-    return {**data, "providers": [p for p in providers
-                                 if p.get("provider") != "claude"] + fallback}
+        return cached
+    claude = [p for p in cached["providers"] if p.get("provider") == "claude"
+              and p.get("source") == "quota-dash-cache"]
+    return {**cached, "providers": [p for p in cached["providers"]
+                                   if p.get("provider") != "claude"]
+            + newest_claude_readings(claude, fallback)}
+
+
+def claude_window_key(window):
+    key = window.get("id")
+    if isinstance(key, str) and key.startswith("model:"):
+        return "anthropic:7d:" + key[6:]
+    return {"five_hour": "anthropic:5h", "seven_day": "anthropic:7d",
+            "seven_day_opus": "anthropic:7d:opus"}.get(key, key)
+
+
+def newest_claude_readings(cached, fallback):
+    candidates = cached + fallback
+    omp_accounts = {QuotaCache.key(p)[1] for p in fallback}
+    winners = {}
+    for index, provider in enumerate(candidates):
+        account = QuotaCache.key(provider)[1]
+        if account == "default" and len(omp_accounts) == 1:
+            account = next(iter(omp_accounts))
+        state = provider.get("state") or {}
+        for window in provider.get("windows", []):
+            key = account, claude_window_key(window)
+            stamp = as_local(window.get("recordedAt") if provider.get("source") == "omp"
+                             else state.get("refreshedAt"))
+            previous = winners.get(key)
+            if previous is None or (stamp is not None
+                                    and (previous[2] is None or stamp > previous[2])):
+                winners[key] = index, window, stamp
+    return [{**provider, "windows": [w for owner, w, _ in winners.values() if owner == index]}
+            for index, provider in enumerate(candidates)
+            if provider.get("credits") is not None
+            or any(owner == index for owner, _, _ in winners.values())]
 
 
 def read_omp_claude():
@@ -428,7 +574,7 @@ def windows_table(live_providers, now=None):
             error_text = error if isinstance(error, str) and error else ""
             t.add_row(Text(f"↻ {mark}", style="yellow"), "",
                       Text(age_text, style="dim"), "",
-                      Text(error_text, style="dim"))
+                      Text(f"not updating · {error_text}", style="yellow"))
             shown = True
     if not shown:
         t.add_row(Text("no window data", style="dim"), "", "", "", "")
@@ -451,7 +597,9 @@ def pace_table(rows, now=None):
 
         burn = pace.get("burnMultiple")
         left = Text()
-        if isinstance(burn, (int, float)):
+        if stale:
+            left.append("—  last valid reading", style="dim")
+        elif isinstance(burn, (int, float)):
             style = "green" if burn < 0.9 else ("cyan" if burn <= 1.1 else "red")
             word = ("under budget" if burn < 0.9
                     else ("on budget" if burn <= 1.1 else "OVER ⚡"))
@@ -483,7 +631,7 @@ def pace_table(rows, now=None):
     return t
 
 
-def payg_table(bal, avail, legacy_auth=False, now=None):
+def payg_table(bal, avail, legacy_auth=False, now=None, stale_at=None):
     t = Table(box=None, pad_edge=False, show_header=False, padding=(0, 1, 1, 1))
     t.add_column(width=18)
     t.add_column(width=2)
@@ -496,10 +644,16 @@ def payg_table(bal, avail, legacy_auth=False, now=None):
         peak = now.astimezone(timezone.utc).hour in DEEPSEEK_PEAK_HOURS_UTC
         ok = avail != "no"
         line = Text()
-        line.append(f"${bal['total_balance']}", style="green" if ok else "red")
-        if not ok:
+        line.append(f"${bal['total_balance']}",
+                    style="yellow" if stale_at else ("green" if ok else "red"))
+        if not ok and not stale_at:
             line.append("   UNUSABLE — top up before routing work here", style="red")
-        t.add_row("DeepSeek balance", "🟢" if ok else "🔴", line)
+        t.add_row("DeepSeek balance", "⚠" if stale_at else ("🟢" if ok else "🔴"), line)
+        if stale_at:
+            age = max(0.0, (now - stale_at).total_seconds() / 3600)
+            t.add_row("", "", Text(
+                f"↻ stale — not updating · {span(age)} old · balance unreachable",
+                style="yellow"))
 
         price = Text()
         if peak:
@@ -557,12 +711,18 @@ def render_dashboard(data, bal, avail, history, legacy_auth=False, now=None):
     asleep = [p.get("provider") for p in providers
               if p.get("source") == "unavailable"]
     stale = [p for p in live if _is_stale(p)]
+    balance_stale_at = None
+    if bal == "unreachable" and history:
+        latest = history[-1]
+        balance_stale_at = as_local(latest["at"])
+        if balance_stale_at:
+            bal = latest["deepseek"]
 
     wtable, rows = windows_table(live, now)
     tag = "  ·  ".join(f"{p.get('provider')} {p.get('plan', '')}".strip() for p in live)
 
     body = Group(
-        Text(tag, style="dim"),
+        Text(data.get("error") or tag, style="yellow" if data.get("error") else "dim"),
         Text(),
         heading("📊", "Subscription Windows", "capacity left before each window resets"),
         Rule(style="grey30"),
@@ -574,7 +734,7 @@ def render_dashboard(data, bal, avail, history, legacy_auth=False, now=None):
         Text(),
         heading("💰", "Pay-as-you-go", "no window to spend down — only a balance"),
         Rule(style="grey30"),
-        payg_table(bal, avail, legacy_auth, now),
+        payg_table(bal, avail, legacy_auth, now, stale_at=balance_stale_at),
         Text(),
         heading("📅", "DeepSeek History", "directions stay separate; burn uses usage only"),
         Rule(style="grey30"),
@@ -610,8 +770,11 @@ def frame():
     history = load_history()
 
     if data is None:
-        return Panel(Text("quota-axi returned nothing readable — is it authenticated?",
-                          style="red"), title="AGENT CAPACITY", border_style="red")
+        if isinstance(bal, dict) or (bal == "unreachable" and history):
+            data = {"providers": [], "error": "quota-axi unavailable — no saved subscription reading"}
+        else:
+            return Panel(Text("quota-axi returned nothing readable — is it authenticated?",
+                              style="red"), title="AGENT CAPACITY", border_style="red")
     return render_dashboard(data, bal, avail, history, legacy_auth, now)
 
 

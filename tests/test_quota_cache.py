@@ -119,6 +119,34 @@ class QuotaCacheTests(unittest.TestCase):
         data = self.cache.update(None, error="offline", now=NOW)
         self.assertEqual(data["providers"][0]["windows"], [])
 
+    def test_omitted_windows_preserve_saved_reading_through_failure_and_restart(self):
+        original = {
+            "provider": "codex", "source": "oauth", "account": {"accountId": "synthetic"},
+            "windows": [{"id": "five_hour", "percentRemaining": 72}],
+            "state": {"status": "fresh", "stale": False,
+                      "refreshedAt": "2026-11-17T01:00:00Z"},
+        }
+        incomplete = {key: value for key, value in original.items() if key != "windows"}
+        responses = [subprocess.CompletedProcess(
+            [], 0, stdout=json.dumps({"providers": [report]}))
+            for report in (original, incomplete)] + [OSError("offline"), OSError("offline")]
+        globals_ = DASH["read_quota"].__globals__
+        with patch.dict(globals_, QUOTA_CACHE=self.cache, read_omp_claude=lambda: []), \
+                patch("subprocess.run", side_effect=responses):
+            DASH["read_quota"]()
+            saved = self.path.read_bytes()
+            omitted = DASH["read_quota"]()["providers"][0]
+            failed_refresh = DASH["read_quota"]()["providers"][0]
+            with patch.dict(globals_, QUOTA_CACHE=DASH["QuotaCache"](self.path)):
+                restarted = DASH["read_quota"]()["providers"][0]
+        for stage, reading in (("omitted", omitted), ("failure", failed_refresh),
+                               ("restart offline", restarted)):
+            with self.subTest(stage=stage):
+                self.assertEqual(original["windows"], reading.get("windows"))
+                self.assertTrue(reading["state"]["stale"])
+                self.assertEqual(original["state"]["refreshedAt"], reading["state"]["refreshedAt"])
+        self.assertEqual(saved, self.path.read_bytes())
+
     def test_default_json_without_source_is_saved_across_restart(self):
         fresh = provider()
         del fresh["source"]
@@ -211,6 +239,7 @@ class BalanceFallbackTests(unittest.TestCase):
         self.assertNotIn("$12.50", unconfigured)
 
     def test_balance_survives_subscription_failure_without_recording_cached_samples(self):
+        (ROOT / ".cache").mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(dir=ROOT / ".cache") as directory:
             path = Path(directory) / "history.jsonl"
             balances = {"total_balance": "12.50", "granted_balance": "2.50",

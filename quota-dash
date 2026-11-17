@@ -103,7 +103,7 @@ class QuotaCache:
                 and provider.get("source") not in ("unavailable", "cache")
                 and state.get("status") == "fresh"
                 and not state.get("stale")
-                and (not provider.get("windows") or usable_windows(provider)))
+                and (provider.get("windows") == [] or usable_windows(provider)))
 
     def update(self, data, error="quota-axi returned no readable data", now=None):
         now = now or datetime.now(timezone.utc)

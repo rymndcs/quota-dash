@@ -81,6 +81,111 @@ class QuotaCacheTests(unittest.TestCase):
         self.assertEqual(failed_again["providers"][0]["windows"][0]["percentRemaining"], 60)
         self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
 
+    def anonymous_failure_after_identified_success(self, status, error):
+        original = {
+            "provider": "claude", "source": "oauth",
+            "account": {"accountId": "synthetic", "identityStatus": "verified"},
+            "windows": [{"id": "five_hour", "label": "session", "percentRemaining": 72}],
+            "state": {"status": "fresh", "stale": False,
+                      "refreshedAt": "2026-11-17T01:00:00Z"},
+        }
+        failure = {"provider": "claude", "source": "unavailable", "windows": [],
+                   "state": {"status": status, "stale": False, "error": error}}
+        responses = [subprocess.CompletedProcess(
+            [], 0, stdout=json.dumps({"providers": [report]}))
+            for report in (original, failure, failure)]
+        globals_ = DASH["read_quota"].__globals__
+        with patch.dict(globals_, QUOTA_CACHE=self.cache, read_omp_claude=lambda: [],
+                        read_deepseek=lambda: ("unconfigured", "", False),
+                        load_history=lambda: []), \
+                patch("subprocess.run", side_effect=responses):
+            DASH["read_quota"]()
+            saved = self.path.read_bytes()
+            data = DASH["read_quota"]()
+            frame_text = render(DASH["frame"]())
+        cached = next(p for p in data["providers"] if p.get("account") == original["account"])
+        self.assertEqual(original["windows"], cached["windows"])
+        self.assertEqual("quota-dash-cache", cached["source"])
+        self.assertTrue(cached["state"]["stale"])
+        self.assertEqual(original["state"]["refreshedAt"], cached["state"]["refreshedAt"])
+        self.assertEqual({("claude", "synthetic"): original}, self.cache.providers)
+        self.assertEqual(saved, self.path.read_bytes())
+        with self.subTest(entrypoint="read_quota diagnostic"):
+            self.assertEqual(error, cached["state"]["error"])
+        for entrypoint, text in (
+                ("read_quota/render_dashboard", render(DASH["render_dashboard"](
+                    data, "unconfigured", "", [], now=NOW))), ("frame", frame_text)):
+            with self.subTest(entrypoint=entrypoint, check="capacity/stale"):
+                for expected in ("72.0%", "not updating", "claude stale", "0 live"):
+                    self.assertIn(expected, text)
+            with self.subTest(entrypoint=entrypoint, check="real error"):
+                self.assertTrue(error in text, f"missing provider error: {error}")
+            with self.subTest(entrypoint=entrypoint, check="false missing error"):
+                self.assertFalse("provider missing from quota-axi response" in text,
+                                 "false provider-missing diagnostic remains")
+            with self.subTest(entrypoint=entrypoint, check="sleeping duplicate"):
+                self.assertFalse("💤 claude" in text, "sleeping Claude duplicates the stale reading")
+
+    def test_anonymous_sign_in_failure_keeps_identified_quota_and_real_error(self):
+        self.anonymous_failure_after_identified_success("auth_required", "Claude sign-in required")
+
+    def test_anonymous_rate_limit_failure_keeps_identified_quota_and_real_error(self):
+        self.anonymous_failure_after_identified_success("rate_limited", "rate limited")
+
+    def test_provider_failure_diagnostics_preserve_account_and_provider_separation(self):
+        first, second = provider(), provider(remaining=36)
+        first["account"] = {"accountId": "first"}
+        second["account"] = {"accountId": "second"}
+        self.cache.update({"providers": [first, second, provider("cursor")]}, now=NOW)
+        saved = self.path.read_bytes()
+        specific = {**failed(), "account": {"accountId": "first"},
+                    "state": {"status": "error", "error": "first account failed"}}
+        anonymous = failed()
+        other = {**failed("codex"), "state": {"status": "error", "error": "Codex failed"}}
+        data = self.cache.update({"providers": [specific, anonymous, other]}, now=NOW)
+        accounts = {p["account"]["accountId"]: p for p in data["providers"] if p.get("account")}
+        self.assertEqual({"first", "second"}, set(accounts))
+        self.assertEqual("first account failed", accounts["first"]["state"]["error"])
+        self.assertEqual(anonymous["state"]["error"], accounts["second"]["state"]["error"])
+        self.assertEqual([72, 36], [accounts[key]["windows"][0]["percentRemaining"]
+                                   for key in ("first", "second")])
+        self.assertEqual(saved, self.path.read_bytes())
+        text = render(DASH["render_dashboard"](data, "unconfigured", "", [], now=NOW))
+        self.assertTrue("💤 codex" in text, "unrelated Codex failure must remain asleep")
+        self.assertFalse("💤 claude" in text, "sleeping Claude duplicates the stale reading")
+
+    def test_other_account_failure_stays_asleep_beside_saved_account(self):
+        original = provider()
+        original["account"] = {"accountId": "first"}
+        self.cache.update({"providers": [original]}, now=NOW)
+        specific = {**failed(), "account": {"accountId": "second"}}
+        data = self.cache.update({"providers": [specific]}, now=NOW)
+        cached = next(p for p in data["providers"] if p.get("source") == "quota-dash-cache")
+        self.assertEqual("provider missing from quota-axi response", cached["state"]["error"])
+        text = render(DASH["render_dashboard"](data, "unconfigured", "", [], now=NOW))
+        self.assertTrue("💤 claude" in text, "a different identified account must remain asleep")
+
+    def test_anonymous_fresh_and_usable_reports_are_not_failure_diagnostics(self):
+        original = provider()
+        original["account"] = {"accountId": "first"}
+        self.cache.update({"providers": [original]}, now=NOW)
+        fresh_empty = provider()
+        fresh_empty["windows"] = []
+        own_cache = provider(remaining=25)
+        own_cache["source"] = "cache"
+        own_cache["state"].update(status="stale", stale=True, error="own cache diagnostic")
+        for report in (fresh_empty, own_cache):
+            with self.subTest(source=report["source"]):
+                data = self.cache.update({"providers": [report]}, now=NOW)
+                cached = next(p for p in data["providers"] if p.get("account") == original["account"])
+                self.assertEqual(original["windows"], cached["windows"])
+                self.assertEqual("provider missing from quota-axi response", cached["state"]["error"])
+        for reports in ([failed()], [own_cache, failed()]):
+            with self.subTest(reports=reports):
+                text = render(DASH["render_dashboard"](
+                    {"providers": reports}, "unconfigured", "", [], now=NOW))
+                self.assertTrue("💤 claude" in text, "without a dashboard snapshot the failure stays asleep")
+
     def test_stale_upstream_data_does_not_overwrite_last_success(self):
         self.cache.update({"providers": [provider()]}, now=NOW)
         stale = provider(remaining=10)

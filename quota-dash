@@ -123,7 +123,13 @@ class QuotaCache:
                 pass
             elif name in self.providers:
                 saved = self.providers[name]
-                failure = provider.get("state") if provider is not None else {}
+                diagnostic = provider
+                if diagnostic is None:
+                    anonymous = current.get((name[0], "default"))
+                    if (anonymous is not None and not self.fresh(anonymous)
+                            and not usable_windows(anonymous)):
+                        diagnostic = anonymous
+                failure = diagnostic.get("state") if diagnostic is not None else {}
                 failure = failure if isinstance(failure, dict) else {}
                 reason = failure.get("error") or failure.get("status")
                 if not reason:
@@ -708,9 +714,12 @@ def render_dashboard(data, bal, avail, history, legacy_auth=False, now=None):
     now = now or datetime.now().astimezone()
     providers = data.get("providers", [])
     live = [p for p in providers if p.get("source") != "unavailable"]
-    asleep = [p.get("provider") for p in providers
-              if p.get("source") == "unavailable"]
     stale = [p for p in live if _is_stale(p)]
+    asleep = [p.get("provider") for p in providers
+              if p.get("source") == "unavailable"
+              and not (QuotaCache.key(p)[1] == "default"
+                       and any(s.get("provider") == p.get("provider")
+                               and s.get("source") == "quota-dash-cache" for s in stale))]
     balance_stale_at = None
     if bal == "unreachable" and history:
         latest = history[-1]
